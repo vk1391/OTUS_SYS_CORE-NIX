@@ -7,7 +7,7 @@
 
  - Был установлен Ubuntu server 24.04.1:
 ```
-uanme -r
+uname -r
 6.8.0-48-generic
 ```
  - Из  https://kernel.ubuntu.com/mainline/ было скачана и установлена актуальная версия ядра:
