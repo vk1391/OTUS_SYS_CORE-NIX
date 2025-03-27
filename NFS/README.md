@@ -24,7 +24,7 @@ sudo systemctl daemon-reload # заставляем перечитать кон�
 sudo systemctl restart remote-fs.target # перезагружаем nfs клиента
 sudo systemctl enable remote-fs.target # добавляем в автозагрузку nfs клиент
 ```
-проверяем какая версия nfs:
+ - проверяем какая версия nfs:
 ```
 systemd-1 on /mnt type autofs (rw,relatime,fd=60,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=24631)
 nsfs on /run/snapd/ns/lxd.mnt type nsfs (rw)
