@@ -190,7 +190,6 @@ all:
       ansible_connection: local
       ansible_host: 127.0.0.1
       ansible_user: vagrant
-      ansible_private_key_file: "~/.ssh/id_rsa"
 ```
  - генерим пару ssh и толкаем серверу:
 ```
