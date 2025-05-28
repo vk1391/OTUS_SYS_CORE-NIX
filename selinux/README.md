@@ -139,6 +139,187 @@ Audit2allow сформировал модуль, и сообщил нам ком
 libsemanage.semanage_direct_remove_key: Removing last nginx module (no other nginx module exists at another priority).
 ```
 # Обеспечить работоспособность приложения при включенном selinux
+1. подготовка стенда
+ -  так как на windows нет возможности установить ansible, приводим vagrantfile из `https://github.com/Nickmob/vagrant_selinux_dns_problems.git` к следующему виду:
+```
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure(2) do |config|
+  config.vm.box = "almalinux/9"
+  config.vm.box_version = "9.4.20240805"
+ # config.vm.provision "ansible" do |ansible|
+ #   #ansible.verbose = "vvv"
+ #   ansible.playbook = "provisioning/playbook.yml"
+ #   ansible.become = "true"
+
+  config.vm.provider "virtualbox" do |v|
+	  v.memory = 2048
+    v.cpus = 2    
+  end
+
+  config.vm.define "ns01" do |ns01|
+    ns01.vm.synced_folder ".", "/vagrant", disabled: true
+    ns01.vm.network "private_network", ip: "192.168.50.10", virtualbox__intnet: "dns"
+    ns01.vm.hostname = "ns01"
+  end
+
+  config.vm.define "client" do |client|
+    client.vm.synced_folder ".", "/vagrant", disabled: true
+    client.vm.network "private_network", ip: "192.168.50.15", virtualbox__intnet: "dns"
+    client.vm.hostname = "client"
+  end
+
+end
+```
+ - После деплоя vagrantом заходим на машину client и устанавливаем ansible:
+```
+sudo dnf install epel-release
+sudo dnf install ansible
+```
+ - забираем данный репозиторий с git (https://github.com/Nickmob/vagrant_selinux_dns_problems.git) ,создаем в нем файл inventory/hosts.yaml со следующим содержимым:
+```
+---
+all:
+  hosts:
+    ns01:
+      ansible_user: vagrant
+      ansible_host: 192.168.50.10
+      ansible_private_key_file: "~/.ssh/id_rsa"
+    client:
+      ansible_connection: local
+      ansible_host: 127.0.0.1
+      ansible_user: vagrant
+      ansible_private_key_file: "~/.ssh/id_rsa"
+```
+ - генерим пару ssh и толкаем серверу:
+```
+ssh-keygen
+ssh-copy-id vagrant@192.168.50.10
+```
+ - запускаем ansible playbook из папки provisioning:
+```
+sudo ansible-playbook -i inventory/hosts.yaml playbook.yml
+```
+2. траблшут
+ - Подключимся к клиенту: vagrant ssh client
+ - Попробуем внести изменения в зону: nsupdate -k /etc/named.zonetransfer.key
+```
+[vagrant@client ~]$ nsupdate -k /etc/named.zonetransfer.key
+> server 192.168.50.10
+> zone ddns.lab
+> update add www.ddns.lab. 60 A 192.168.50.15
+> send
+update failed: SERVFAIL
+> quit
+```
+Изменения внести не получилось. Давайте посмотрим логи SELinux, чтобы понять в чём может быть проблема.
+Для этого воспользуемся утилитой audit2why: 	
+```
+[vagrant@client ~]$ sudo -i
+[root@client ~]# cat /var/log/audit/audit.log | audit2why 
+```
+Тут мы видим, что на клиенте отсутствуют ошибки. 
+Не закрывая сессию на клиенте, подключимся к серверу ns01 и проверим логи SELinux:
+```
+# vagrant ssh ns01 
+Last login: Tue Nov 16 09:58:37 2021 from 10.0.2.2
+[vagrant@ns01 ~]$ sudo -i 
+[root@ns01 ~]# cat /var/log/audit/audit.log | audit2why
+type=AVC msg=audit(1734081216.004:1775): avc:  denied  { write } for  pid=7378 comm="isc-net-0001" name="dynamic" dev="sda4" ino=34048387 scontext=system_u:system_r:named_t:s0 tcontext=unconfined_u:object_r:named_conf_t:s0 tclass=dir permissive=0
+
+
+	Was caused by:
+		Missing type enforcement (TE) allow rule.
+
+
+		You can use audit2allow to generate a loadable module to allow this access. 
+```
+В логах мы видим, что ошибка в контексте безопасности. Целевой контекст named_conf_t.
+Для сравнения посмотрим существующую зону (localhost) и её контекст:
+```
+[root@ns01 ~]# ls -alZ /var/named/named.localhost
+-rw-r-----. 1 root named system_u:object_r:named_zone_t:s0 152 Oct  3 05:26 /var/named/named.localhost
+```
+
+У наших конфигов в /etc/named вместо типа named_zone_t используется тип named_conf_t.
+Проверим данную проблему в каталоге /etc/named:
+```
+[root@ns01 ~]# ls -laZ /etc/named
+drw-rwx---. root named system_u:object_r:named_conf_t:s0       .
+drwxr-xr-x. root root  system_u:object_r:named_conf_t:s0       ..
+drw-rwx---. root named unconfined_u:object_r:named_conf_t:s0   dynamic
+-rw-rw----. root named system_u:object_r:named_conf_t:s0       named.50.168.192.rev
+-rw-rw----. root named system_u:object_r:named_conf_t:s0       named.dns.lab
+-rw-rw----. root named system_u:object_r:named_conf_t:s0       named.dns.lab.view1
+-rw-rw----. root named system_u:object_r:named_conf_t:s0       named.newdns.lab 
+```
+Тут мы также видим, что контекст безопасности неправильный. Проблема заключается в том, что конфигурационные файлы лежат в другом каталоге. Посмотреть в каком каталоги должны лежать, файлы, чтобы на них распространялись правильные политики SELinux можно с помощью команды: sudo semanage fcontext -l | grep named
+```
+[root@ns01 ~]# sudo semanage fcontext -l | grep named
+/etc/rndc.*              regular file       system_u:object_r:named_conf_t:s0 
+/var/named(/.*)?         all files          system_u:object_r:named_zone_t:s0 
+...
+```
+Изменим тип контекста безопасности для каталога /etc/named: sudo chcon -R -t named_zone_t /etc/named
+```
+[root@ns01 ~]# sudo chcon -R -t named_zone_t /etc/named
+[root@ns01 ~]# 
+[root@ns01 ~]# ls -laZ /etc/named
+drw-rwx---. root named system_u:object_r:named_zone_t:s0 .
+drwxr-xr-x. root root  system_u:object_r:etc_t:s0       ..
+drw-rwx---. root named unconfined_u:object_r:named_zone_t:s0 dynamic
+-rw-rw----. root named system_u:object_r:named_zone_t:s0 named.50.168.192.rev
+-rw-rw----. root named system_u:object_r:named_zone_t:s0 named.dns.lab
+-rw-rw----. root named system_u:object_r:named_zone_t:s0 named.dns.lab.view1
+-rw-rw----. root named system_u:object_r:named_zone_t:s0 named.newdns.lab 
+```
+Попробуем снова внести изменения с клиента: 
+```
+[vagrant@client ~]$ nsupdate -k /etc/named.zonetransfer.key
+> server 192.168.50.10
+> zone ddns.lab
+> update add www.ddns.lab. 60 A 192.168.50.15
+> send
+> quit  
+[vagrant@client ~]$ dig @192.168.50.10 www.ddns.lab
+
+
+; <<>> DiG 9.11.4-P2-RedHat-9.11.4-26.P2.el7_9.7 <<>> @192.168.50.10 www.ddns.lab
+; (1 server found)
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 52392
+;; flags: qr aa rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 1, ADDITIONAL: 2
+
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 4096
+;; QUESTION SECTION:
+;www.ddns.lab.          IN  A
+
+
+;; ANSWER SECTION:
+www.ddns.lab.       60  IN  A   192.168.50.15
+
+
+;; AUTHORITY SECTION:
+ddns.lab.       3600    IN  NS  ns01.dns.lab.
+
+
+;; ADDITIONAL SECTION:
+ns01.dns.lab.       3600    IN  A   192.168.50.10
+
+
+;; Query time: 2 msec
+;; SERVER: 192.168.50.10#53(192.168.50.10)
+;; WHEN: Thu Nov 18 15:49:07 UTC 2021
+;; MSG SIZE  rcvd: 96
+```
+- Для того, чтобы вернуть правила обратно, можно ввести команду: restorecon -v -R /etc/named
+
+
+
 
 
 
